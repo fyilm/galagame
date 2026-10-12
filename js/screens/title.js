@@ -35,11 +35,20 @@ function drawBackdrop(R, t) {
   blob(R.W * 0.86, R.H * 0.48, R.W * 0.45, 'rgba(180,120,90,0.09)', 3.2);
 }
 
+function countEndings() {
+  var n = 0;
+  var list = Works.PACKAGES || [];
+  for (var i = 0; i < list.length; i++) {
+    var ae = list[i].ALL_ENDINGS;
+    n += ae ? ae.length : 0;
+  }
+  return n;
+}
+
 var Title = {
   enter: function () {
-    this.totalEndings = Works.PACKAGES.reduce(function (s, p) {
-      return s + p.ALL_ENDINGS.length;
-    }, 0);
+    // 兜底重算一次，避免引擎未调用 enter 时页面空白
+    this.totalEndings = countEndings();
   },
 
   update: function (dt) {
@@ -50,6 +59,10 @@ var Title = {
     var ctx = R.ctx;
     var fs = R.fontSize;
     var cx = R.W / 2;
+
+    // 提前取好数值，fadeIn 回调里的 this 不是 Title，不能用 this.xxx
+    var pkgCount = (Works.PACKAGES || []).length;
+    var totalEndings = (typeof this.totalEndings === 'number') ? this.totalEndings : countEndings();
 
     drawBackdrop(R, t);
 
@@ -104,7 +117,7 @@ var Title = {
       ctx.fillStyle = '#8b8ba4';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      var line = Works.PACKAGES.length + ' 部作品 · ' + this.totalEndings + ' 个结局';
+      var line = pkgCount + ' 部作品 · ' + totalEndings + ' 个结局';
       ctx.fillText(line, cx, divY + fs(20));
       ctx.textAlign = 'left';
     });
