@@ -45,6 +45,18 @@ function countEndings() {
   return n;
 }
 
+/**
+ * 把断点场景换算成人能读懂的进度标签。
+ *
+ * 剧本每个场景都带 act 字段（如「第三幕 · 收网」），直接用它最准 ——
+ * 比按场景 id 猜要可靠，也比显示一个内部 id 友好。
+ */
+function sceneLabel(pkg, sceneId) {
+  var sc = pkg && pkg.STORY && pkg.STORY[sceneId];
+  if (sc && sc.act) return sc.act;
+  return '上次进度';
+}
+
 var Title = {
   enter: function () {
     // 兜底重算一次，避免引擎未调用 enter 时页面空白
@@ -147,23 +159,52 @@ var Title = {
     if (last) {
       var pkg = Works.byId(last);
       if (pkg) {
+        // 关键：这里必须问一句「有没有真断点」。
+        // 以前不管有没有断点都显示「继续」，点下去却从序幕重开 ——
+        // 文案和行为对不上，玩家会以为存档丢了。
+        var prog = Save.getProgress(pkg.meta.id, pkg.STORY || {});
         var ctaY = btn1Y + btnH + fs(13);
-        var prog = Save.count(last);
-        R.hit('continue:' + last, cx - btnW / 2, ctaY, btnW, fs(44));
-        fadeIn(0.85, function () {
-          R.roundRectFill(cx - btnW / 2, ctaY, btnW, fs(44), 12, 'rgba(255,255,255,0.06)');
-          R.roundRectStroke(cx - btnW / 2, ctaY, btnW, fs(44), 12, 'rgba(230,200,122,0.26)', 1);
-          ctx.font = fs(12.5) + 'px sans-serif';
-          ctx.fillStyle = '#c8a24a';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText('继续 · ' + pkg.meta.title, cx, ctaY + fs(16));
-          ctx.fillStyle = '#6f6f85';
-          ctx.font = fs(10.5) + 'px sans-serif';
-          ctx.fillText('结局 ' + prog + ' / ' + pkg.ALL_ENDINGS.length, cx, ctaY + fs(31));
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'top';
-        });
+        var ctaH = fs(44);
+        var unlocked = Save.count(last);
+
+        if (prog) {
+          var label = sceneLabel(pkg, prog.s);
+          R.hit('continue:' + last, cx - btnW / 2, ctaY, btnW, ctaH);
+          fadeIn(0.85, function () {
+            R.roundRectFill(cx - btnW / 2, ctaY, btnW, ctaH, 12, 'rgba(255,255,255,0.06)');
+            R.roundRectStroke(cx - btnW / 2, ctaY, btnW, ctaH, 12, 'rgba(230,200,122,0.26)', 1);
+            ctx.font = fs(12.5) + 'px sans-serif';
+            ctx.fillStyle = '#c8a24a';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('继续 · ' + pkg.meta.title, cx, ctaY + fs(16));
+            ctx.fillStyle = '#6f6f85';
+            ctx.font = fs(10.5) + 'px sans-serif';
+            ctx.fillText(label + ' · 结局 ' + unlocked + ' / ' + pkg.ALL_ENDINGS.length,
+                         cx, ctaY + fs(31));
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+          });
+        } else {
+          // 没有断点（玩完了 / 从没玩过）：不要再写「继续」误导，
+          // 改成明确的「重新开始」，行为也和文案一致。
+          R.hit('restart:' + last, cx - btnW / 2, ctaY, btnW, ctaH);
+          fadeIn(0.85, function () {
+            R.roundRectFill(cx - btnW / 2, ctaY, btnW, ctaH, 12, 'rgba(255,255,255,0.04)');
+            R.roundRectStroke(cx - btnW / 2, ctaY, btnW, ctaH, 12, 'rgba(255,255,255,0.12)', 1);
+            ctx.font = fs(12.5) + 'px sans-serif';
+            ctx.fillStyle = '#9a97ad';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('重新开始 · ' + pkg.meta.title, cx, ctaY + fs(16));
+            ctx.fillStyle = '#6f6f85';
+            ctx.font = fs(10.5) + 'px sans-serif';
+            ctx.fillText('结局 ' + unlocked + ' / ' + pkg.ALL_ENDINGS.length,
+                         cx, ctaY + fs(31));
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+          });
+        }
       }
     }
 
@@ -179,7 +220,11 @@ var Title = {
   onTap: function (id) {
     if (id === 'library') return 'library';
     if (id && id.indexOf('continue:') === 0) {
-      return { play: id.slice(9) };
+      // 续玩：带上 resume 标记，由 Game.enter 决定从断点还是序幕开始
+      return { play: id.slice(9), resume: true };
+    }
+    if (id && id.indexOf('restart:') === 0) {
+      return { play: id.slice(8) };
     }
     return null;
   }

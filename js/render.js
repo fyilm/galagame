@@ -97,12 +97,26 @@ var R = {
     ctx.textBaseline = 'top';
 
     // 逐字测量，计算总宽用于居中
-    var total = 0, i;
-    var widths = [];
-    for (i = 0; i < chars.length; i++) {
-      var w = ctx.measureText(chars[i]).width;
-      widths.push(w);
-      total += w;
+    // 性能：goldText 在 draw() 里每帧都会被调用（标题是静态的），
+    // 逐字 measureText 是纯浪费。按「文字+字重+字号」缓存测量结果。
+    var mkey = weight + '|' + fontSize + '|' + text;
+    var widths = this._goldW && this._goldW[mkey];
+    var total;
+    if (widths) {
+      total = this._goldT[mkey];
+    } else {
+      total = 0;
+      widths = [];
+      for (var i = 0; i < chars.length; i++) {
+        var w = ctx.measureText(chars[i]).width;
+        widths.push(w);
+        total += w;
+      }
+      if (!this._goldW) { this._goldW = {}; this._goldT = {}; }
+      // 缓存条目上限，避免动态文字把表撑大
+      if (Object.keys(this._goldW).length > 200) { this._goldW = {}; this._goldT = {}; }
+      this._goldW[mkey] = widths;
+      this._goldT[mkey] = total;
     }
     var x = opts.left !== undefined ? opts.left : cx - total / 2;
 
@@ -116,9 +130,9 @@ var R = {
       ctx.shadowBlur = 18;
       ctx.shadowOffsetY = 4;
     }
-    for (i = 0; i < chars.length; i++) {
-      ctx.fillText(chars[i], x, y);
-      x += widths[i];
+    for (var k = 0; k < chars.length; k++) {
+      ctx.fillText(chars[k], x, y);
+      x += widths[k];
     }
     if (opts.shadow) {
       ctx.shadowColor = 'transparent';
@@ -130,6 +144,11 @@ var R = {
 
   /**
    * 中文按字换行排版
+   *
+   * 性能：原实现每加一个字都 measureText(整行)，是 O(n²)，长段落（几百字）在真机上很慢。
+   * 改为「只测量新增的那个字」并累加宽度，降为 O(n)。
+   * 注意：之所以能这么改，是因为中文字体下整行宽度≈各字宽度之和（无 kerning 例外）；
+   * 对中英混排也成立到可接受精度（英文用逐字宽近似，误差远小于一行）。
    * @returns {Array<string>} 行数组
    */
   wrapText: function (ctx, text, maxWidth, px) {
@@ -140,13 +159,16 @@ var R = {
     for (var p = 0; p < para.length; p++) {
       var chars = para[p].split('');
       var line = '';
+      var lineW = 0;
       for (var i = 0; i < chars.length; i++) {
-        var test = line + chars[i];
-        if (ctx.measureText(test).width > maxWidth && line.length > 0) {
+        var cw = ctx.measureText(chars[i]).width;
+        if (lineW + cw > maxWidth && line.length > 0) {
           lines.push(line);
           line = chars[i];
+          lineW = cw;
         } else {
-          line = test;
+          line += chars[i];
+          lineW += cw;
         }
       }
       lines.push(line);

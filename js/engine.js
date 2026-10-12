@@ -18,6 +18,30 @@ var SCREENS = {
   collect: Collect
 };
 
+/**
+ * 统一各屏幕 enter() 的入参形态。
+ *
+ * 历史上 enter 只收剧本 id 字符串（switchTo('game', 'duanju')），
+ * 现在还要能带选项（{scriptId, resume}）。统一在这里归一，
+ * 各屏就不用各自兼容两种形态了。
+ */
+function normalizeEnter(name, arg) {
+  var screen = SCREENS[name];
+  if (!screen || !screen.enter) return;
+
+  // game 屏：把两种形态都归一成 (scriptId, opts)
+  if (name === 'game') {
+    if (arg && typeof arg === 'object') {
+      screen.enter(arg.scriptId, { resume: !!arg.resume });
+    } else {
+      screen.enter(arg, { resume: false });
+    }
+    return;
+  }
+
+  screen.enter(arg);
+}
+
 var Engine = {
   cur: 'title',
   prevScreen: 'title',   // 最近一次切换的来源页
@@ -46,16 +70,25 @@ var Engine = {
       });
     }
 
-    // 前后台切换：后台停循环，回前台重置时间基准并重启循环。
-    // 真机上不加这段，切后台再回来可能出现画面停在那一帧不动（看起来像卡死）。
+    // 回前台时重置时间基准（防止 dt 变成几十秒把动画带飞）。
+    // 注意：这里只重置时间，绝不停循环——停循环一旦 onShow 没配对触发，
+    // 整个游戏就会永久冻结在最后一帧，点击完全没有反应。
     if (wx.onShow) {
       wx.onShow(function () {
-        Engine.onShow();
+        Engine.lastTime = Date.now();
+        // 双保险：万一循环因任何原因停了，这里无条件重新拉起
+        if (!Engine.running) {
+          Engine.running = true;
+          Engine.loop();
+        }
       });
     }
+
+    // 切后台 / 可能被系统回收前，主动把剧情进度落盘一次。
+    // 小游戏被回收后内存态全丢，只能靠这次落盘兜住。
     if (wx.onHide) {
       wx.onHide(function () {
-        Engine.onHide();
+        Engine.flushProgress();
       });
     }
 
@@ -65,6 +98,28 @@ var Engine = {
   },
 
 fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
+
+  /**
+   * 调起某个屏幕的 enter()。
+   *
+   * enter 的入参历史上有两种形态，这里统一掉，避免各屏都要自己兼容：
+   *   switchTo('game', 'duanju')                      → 直接给剧本 id
+   *   switchTo('game', {scriptId:'duanju',resume:1})  → 带选项
+   * 其余屏幕的 enter 不收参数，照旧传 undefined 即可。
+   */
+  /**
+   * 把剧情进度立刻落盘。由 wx.onHide 触发 —— 小游戏切后台后随时可能
+   * 被系统回收，内存态全丢，这是唯一的兜底时机。
+   *
+   * 只在剧情页需要落盘：结局页已经清过断点，其余页面没有进行中的剧情。
+   */
+  flushProgress: function () {
+    if (this.cur !== 'game') return;
+    var g = SCREENS.game;
+    if (g && g.saveNow) {
+      try { g.saveNow(); } catch (e) {}
+    }
+  },
 
   switchTo: function (name, arg, keepState) {
     if (!SCREENS[name]) return;
@@ -83,7 +138,7 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     this.t = 0;
     // keepState：从图鉴返回剧情页时，保留已播放的进度
     if (!keepState) {
-      SCREENS[name].enter(arg);
+      normalizeEnter(name, arg);
     } else if (name === 'game') {
       // 保留现场回到剧情页：若上次在「选完选项、转场进行中」离开，
       // 会残留 gotoScene + flashT/locked。此时 gotoScene 只有在
@@ -97,12 +152,39 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
   loop: function () {
     if (!this.running) return;
 
+    // 关键：整个循环体包在 try/catch 里。
+    // 只要 update/draw 里抛一次异常，requestAnimationFrame 就不会再被排程，
+    // 主循环永久停止 → 画面停在最后一帧、点击完全没反应（就是"卡住"）。
+    // 这里保证无论发生什么，下一帧都一定会被排上。
+    try {
+      this.tickOnce();
+    } catch (err) {
+      // 输出错误便于排查，但不让循环中断
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('[engine] 主循环异常:', err && (err.stack || err.message || err));
+      }
+    }
+
+    var self = this;
+    if (typeof wx.requestAnimationFrame === 'function') {
+      wx.requestAnimationFrame(function () { self.loop(); });
+    } else {
+      setTimeout(function () { self.loop(); }, 16);
+    }
+  },
+
+  /** 单帧逻辑（与排程分离，便于异常隔离） */
+  tickOnce: function () {
     var now = Date.now();
+    // 上限 0.05s：从后台回来时 now-lastTime 可能是几十秒，
+    // 不夹住会让打字机/动画一帧跳完。
     var dt = Math.min(0.05, (now - this.lastTime) / 1000);
+    if (!(dt > 0)) dt = 0.016;   // 时钟异常兜底，保证动画不卡住
     this.lastTime = now;
     this.t += dt;
 
     var screen = SCREENS[this.cur];
+    if (!screen) return;
 
     // 屏幕内部可能返回新的场景名（如剧情结束 → 结局页）
     // 这是内部流转，返回栈沿用来源（如从剧集库进来，仍回剧集库）
@@ -126,27 +208,6 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     }
 
     this.render(screen);
-
-    var self = this;
-    if (typeof wx.requestAnimationFrame === 'function') {
-      wx.requestAnimationFrame(function () { self.loop(); });
-    } else {
-      setTimeout(function () { self.loop(); }, 16);
-    }
-  },
-
-  /** 从后台回前台：重置时间基准，避免 dt 异常把动画/打字机带飞或停摆 */
-  onShow: function () {
-    this.lastTime = Date.now();
-    if (!this.running) {
-      this.running = true;
-      this.loop();
-    }
-  },
-
-  onHide: function () {
-    // 主动停掉主循环，回前台时由 onShow 重新拉起
-    this.running = false;
   },
 
   render: function (screen) {
@@ -157,18 +218,57 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
 
   /* ============ 触摸 ============ */
 
+  /**
+   * 兼容取触摸坐标 — 返回归一化后的 {x, y}。
+   *
+   * 微信小游戏不同基础库/机型上，触点可能只有 clientX/Y，也可能只有 x/y，
+   * 拿错字段会得到 undefined，导致 onTouchEnd 里提前 return，
+   * 表现为「画面正常但点击完全没反应」。
+   *
+   * 另外部分真机把坐标报成「物理像素」(= 逻辑像素 × dpr)。
+   * 关键点：必须**整体判断**，不能对 x、y 分别设阈值！
+   * 反例（曾经踩过）：图鉴按钮在右上角，y 仅 70 逻辑像素，
+   * ×dpr(3) 后是 210，仍小于 H*1.5=1266，于是 y 不换算、x 换算，
+   * 坐标被劈成两半 → 点哪都命中不了。
+   * 所以这里只看「任一轴明显超出逻辑范围」就整体换算。
+   */
+  normPoint: function (vx, vy) {
+    var W = R.W || 0;
+    var H = R.H || 0;
+    var dpr = R.dpr || 1;
+    if (dpr > 1 && ((W && vx > W * 1.2) || (H && vy > H * 1.2))) {
+      return { x: vx / dpr, y: vy / dpr };
+    }
+    return { x: vx, y: vy };
+  },
+
+  /** 从触点对象里抽出 {x, y}（逻辑坐标），兼容 clientX/Y、x/y、pageX/Y */
+  touchPoint: function (t) {
+    if (!t) return null;
+    var vx, vy, has = false;
+    if (typeof t.clientX === 'number' && typeof t.clientY === 'number') {
+      vx = t.clientX; vy = t.clientY; has = true;
+    } else if (typeof t.x === 'number' && typeof t.y === 'number') {
+      vx = t.x; vy = t.y; has = true;
+    } else if (typeof t.pageX === 'number' && typeof t.pageY === 'number') {
+      vx = t.pageX; vy = t.pageY; has = true;
+    }
+    if (!has) return null;
+    return this.normPoint(vx, vy);
+  },
+
   onTouchStart: function (e) {
     var t = e.touches && e.touches[0];
     if (!t) return;
-    var x = t.clientX;
-    var y = t.clientY;
+    var p = this.touchPoint(t);
+    if (!p) return;
     var screen = SCREENS[this.cur];
 
-    if (screen.onTouchStart) screen.onTouchStart(y);
+    if (screen.onTouchStart) screen.onTouchStart(p.y);
 
-    this._downX = x;
-    this._downY = y;
-    this._lastMoveY = y;
+    this._downX = p.x;
+    this._downY = p.y;
+    this._lastMoveY = p.y;
     this._dragged = false;
   },
 
@@ -176,24 +276,26 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     var t = e.touches && e.touches[0];
     if (!t) return;
     var screen = SCREENS[this.cur];
+    var p = this.touchPoint(t);
+    if (!p) return;
 
-    if (screen.onTouchMove) screen.onTouchMove(t.clientY);
+    if (screen.onTouchMove) screen.onTouchMove(p.y);
 
     if (this._downX !== undefined) {
-      var dx = t.clientX - this._downX;
-      var dy = t.clientY - this._downY;
+      var dx = p.x - this._downX;
+      var dy = p.y - this._downY;
       if (dx * dx + dy * dy > 100) this._dragged = true;
     }
 
     // 结局页长文本滚动
     if (this.cur === 'ending' && screen.onTap) {
-      var id = R.hitTest(t.clientX, t.clientY);
+      var id = R.hitTest(p.x, p.y);
       if (id === 'scroll') {
-        Ending.touchY = (Ending.touchY || 0) + (this._lastMoveY !== undefined ? (this._lastMoveY - t.clientY) : 0);
+        Ending.touchY = (Ending.touchY || 0) + (this._lastMoveY !== undefined ? (this._lastMoveY - p.y) : 0);
         if (Ending.touchY < 0) Ending.touchY = 0;
       }
     }
-    this._lastMoveY = t.clientY;
+    this._lastMoveY = p.y;
   },
 
   onTouchEnd: function (e) {
@@ -201,6 +303,13 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     var x = this._downX;
     var y = this._downY;
     var dragged = this._dragged;
+
+    // 兜底：如果 start 没记到坐标，就用 end 自带的 changedTouches
+    if (typeof x !== 'number' || typeof y !== 'number') {
+      var et = e && e.changedTouches && e.changedTouches[0];
+      var p = this.touchPoint(et);
+      if (p) { x = p.x; y = p.y; }
+    }
 
     if (screen.onTouchEnd) screen.onTouchEnd();
 
@@ -210,7 +319,7 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     this._dragged = false;
 
     // 拖动过就不当作点击
-    if (dragged || x === undefined) return;
+    if (dragged || typeof x !== 'number' || typeof y !== 'number') return;
 
     var id = R.hitTest(x, y);
     if (!id) {
@@ -260,13 +369,14 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
   applyResult: function (result) {
     if (!result) return;
 
-    // 进入指定剧本：{ play: scriptId }
+    // 进入指定剧本：{ play: scriptId, resume?:bool }
     if (typeof result === 'object' && result.play) {
       // 从首页/剧集库进游戏，链的末位是 game
       var base = (this.cur === 'library') ? ['title', 'library'] : ['title'];
       this.backStack = base.concat(['game']);
       this.backIndex = this.backStack.length - 1;
-      this.switchTo('game', result.play);
+      // resume 只在首页「继续」时带上；剧集库点进来是重新开始
+      this.switchTo('game', { scriptId: result.play, resume: !!result.resume });
       return;
     }
 

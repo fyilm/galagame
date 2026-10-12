@@ -14,6 +14,8 @@ var Game = {
   state: { ba: 0, xin: 0, mi: 0 },
   pkg: null,          // 当前剧本包
   scene: null,
+  sceneId: null,      // 当前场景的 id（断点落盘要用）
+  resumed: false,     // 本次进入是否来自断点续玩（供 UI 提示）
   lines: [],
   lineIdx: 0,
   typed: 0,          // 当前句已显示字数
@@ -31,8 +33,12 @@ var Game = {
   /**
    * 进入剧情
    * @param scriptId 剧本 id；不传则沿用当前剧本（供"再玩一次"复用）
+   * @param opts     { resume:true } 时尝试从段内断点接着玩；默认从头
+   *
+   * 断点是「停在哪句就接着哪句」：恢复的不只是场景 id，还有 ba/xin/mi
+   * 三个数值 —— 少了数值，后半程的选项可见性与结局分流全会跑偏。
    */
-  enter: function (scriptId) {
+  enter: function (scriptId, opts) {
     var id = scriptId || (this.pkg && this.pkg.meta.id) || Works.PACKAGES[0].meta.id;
     this.pkg = Works.byId(id);
     if (!this.pkg) return;
@@ -41,8 +47,34 @@ var Game = {
     Save.setScript(this.pkg.meta.id);
     Save.markPlayed(this.pkg.meta.id);
 
-    this.state = { ba: 0, xin: 0, mi: 0 };
-    this.show(this.pkg.meta.start || 'start');
+    // 复位所有「上一次游玩残留的瞬时状态」。
+    //
+    // 必须做这一步：玩到结局时 afterLine() 会把 flashT 置 0、switchTo 置
+    // 'ending'，而 update() 里那条清 flashT 的分支要等转场跑完才执行 ——
+    // 玩家在结局页点「再玩一次」时它俩还挂着。此时若不复位，
+    // afterLine() 一进门就因 `flashT >= 0` 直接 return，新一局的第一幕
+    // 永远出不来选项，表现为「重开后卡在第一幕，点不动」。
+    this.flashT = -1;
+    this.switchTo = null;
+    this.gotoScene = null;
+    this.locked = false;
+    this.ending = null;
+    this.choices = [];
+    this.clock = 0;
+    this.resumed = false;
+
+    var story = this.pkg.STORY || {};
+    var startId = this.pkg.meta.start || 'start';
+    var wantResume = !!(opts && opts.resume);
+
+    // 只在明确要求续玩时读断点。断点指向的场景若已不存在，
+    // Save.getProgress 会返回 null，自动降级为从头开始。
+    var p = wantResume ? Save.getProgress(this.pkg.meta.id, story) : null;
+    var beginId = (p && p.s && story[p.s]) ? p.s : startId;
+
+    this.state = p ? { ba: p.ba, xin: p.xin, mi: p.mi } : { ba: 0, xin: 0, mi: 0 };
+    this.resumed = !!p;                 // 供 UI 显示「已回到上次进度」提示
+    this.show(beginId);
   },
 
   /* ============ 剧情推进 ============ */
@@ -50,6 +82,7 @@ var Game = {
   show: function (id) {
     var sc = this.pkg && this.pkg.STORY[id];
     if (!sc) return;
+    this.sceneId = id;
     this.scene = sc;
     this.lines = sc.text.slice();
     this.lineIdx = 0;
@@ -59,15 +92,52 @@ var Game = {
     this.ending = null;
     this.choicesBorn = 0;
     this.locked = false;   // 解锁，允许新场景接受输入
+
+    this.persist();
   },
 
-  /** 开始播放新的一句 */
+  /**
+   * 落盘当前断点。
+   *
+   * 时机选在 show() —— 也就是「刚踏入一个新场景」的那一刻。
+   * 这样断点的语义很清楚：下次续玩会从这一幕的第一句重新播，
+   * 而不是停在某句台词播到一半的中间态（那种状态没有恢复价值，
+   * 而且 lineIdx/typed 与打字机时序耦合，存了也难保证一致）。
+   *
+   * 结局/收束点不落盘：走到那里已经要出结局了，续玩没有意义。
+   */
+  persist: function () {
+    if (!this.pkg || !this.sceneId) return;
+    var sc = this.pkg.STORY[this.sceneId];
+    if (!sc) return;
+    if (sc.ending || sc.endings) return;   // 结局节点不写断点
+    Save.saveProgress(this.pkg.meta.id, {
+      s: this.sceneId,
+      ba: this.state.ba || 0,
+      xin: this.state.xin || 0,
+      mi: this.state.mi || 0
+    });
+  },
+
+  /** 开始播放新的一句；若已到最后一句，则收尾（出选项 / 进结局） */
   nextLine: function () {
     if (this.typing) {
+      // 打字中点一下 = 立即显示完整这句。
+      // 注意：这里必须调用 afterLine()！
+      // 曾经只把 typing 置 false 就 return，导致「最后一句正在打字时点击」会
+      // 卡死在 lineIdx=末尾、typing=false、choices=[] 的状态：
+      //   选项永远不出现，之后每次点击都被 `lineIdx >= lines.length` 直接 return，
+      //   表现为「画面停在最后一句，点击完全没反应」。
       this.finishTyping();
+      this.afterLine();   // ← 关键：补完收尾，决定该出选项还是进结局
       return;
     }
-    if (this.lineIdx >= this.lines.length) return;
+    if (this.lineIdx >= this.lines.length) {
+      // 台词已播完但收尾还没做（例如从后台回来、或上一步被中断）：
+      // 再兜底一次，避免永久卡住。
+      this.afterLine();
+      return;
+    }
 
     var idx = this.lineIdx++;
     if (this.scene.cast && this.scene.cast[idx]) {
@@ -79,22 +149,69 @@ var Game = {
 
   finishTyping: function () {
     if (!this.scene) return;
+    if (this.lineIdx <= 0) return;   // 还没开始播任何台词，不能取 lines[-1]
     this.typed = this.lines[this.lineIdx - 1].length;
     this.typing = false;
   },
 
-  /** 所有台词结束 → 出选项或进结局 */
+  /** 所有台词结束 → 出选项或进结局（幂等，可安全重复调用） */
   afterLine: function () {
-    if (this.lineIdx >= this.lines.length) {
-      if (this.scene.ending) {
-        this.ending = this.scene.ending;
-        this.flashT = 0;
-        this.switchTo = 'ending';
-        this.gotoScene = null;
-      } else if (this.scene.choices) {
-        this.renderChoices(this.clock);
-      }
+    if (!this.scene) return;
+    if (this.lineIdx < this.lines.length) return;   // 还有台词没播完
+    if (this.choices.length) return;                // 选项已出，不要重复渲染
+    if (this.flashT >= 0 || this.switchTo === 'ending') return;  // 转场已在进行
+
+    // 结局判定：优先用「按数值分流」的 endings 规则表，
+    // 这样多条路可以在同一个收束点，按 ba/xin/mi 落到不同结局，
+    // 不必为每个结局单独建一个场景。
+    var picked = this.pickEnding();
+    if (picked) {
+      this.ending = picked;
+      this.flashT = 0;
+      this.switchTo = 'ending';
+      this.gotoScene = null;
+      this.clearPersist();   // 已到结局，断点使命结束
+      return;
     }
+
+    if (this.scene.ending) {
+      this.ending = this.scene.ending;
+      this.flashT = 0;
+      this.switchTo = 'ending';
+      this.gotoScene = null;
+      this.clearPersist();
+    } else if (this.scene.choices) {
+      this.renderChoices(this.clock);
+    }
+  },
+
+  /**
+   * 清除断点。达成结局时调用 —— 否则玩家下次点「继续」会被送回
+   * 早已走过的收束点，直接又弹一次结局。
+   */
+  clearPersist: function () {
+    if (!this.pkg) return;
+    Save.clearProgress(this.pkg.meta.id);
+  },
+
+  /**
+   * 按数值从 scene.endings 规则表里挑一个结局。
+   *
+   * 规则格式（数组，从上往下取第一条命中的）：
+   *   endings: [
+   *     { cond: { ba: 4, xin: 3 }, ending: {...} },   // 全部满足才命中
+   *     { ending: {...} }                             // 兜底：无条件
+   *   ]
+   *
+   * 没写 endings 时返回 null，走原来的 scene.ending 单结局逻辑。
+   */
+  pickEnding: function () {
+    var rules = this.scene && this.scene.endings;
+    if (!rules || !rules.length) return null;
+    for (var i = 0; i < rules.length; i++) {
+      if (this.condMet(rules[i].cond) && rules[i].ending) return rules[i].ending;
+    }
+    return null;
   },
 
   applyEff: function (eff) {
@@ -106,15 +223,89 @@ var Game = {
     }
   },
 
-  /** cond 为对象形式，如 {mi:2} 表示 mi>=2 */
-  choiceVisible: function (c) {
-    if (!c.cond) return true;
-    for (var k in c.cond) {
-      if (Object.prototype.hasOwnProperty.call(c.cond, k)) {
-        if ((this.state[k] || 0) < c.cond[k]) return false;
+  /**
+   * 数值排序：把 ba/xin/mi 从大到小排，返回 {rank:{ba:0..2}, top, mid, low, spread}
+   * 用于「相对画像」判定 —— 三幕下来数值会累到 30 上下，
+   * 固定阈值（ba>=4）几乎恒真，只有相对高低才有区分度。
+   */
+  statProfile: function () {
+    var ba = this.state.ba || 0, xin = this.state.xin || 0, mi = this.state.mi || 0;
+    var arr = [{ k: 'ba', v: ba }, { k: 'xin', v: xin }, { k: 'mi', v: mi }];
+    arr.sort(function (a, b) { return b.v - a.v; });
+    var rank = {};
+    for (var i = 0; i < 3; i++) rank[arr[i].k] = i;
+    var top = arr[0].v, low = arr[2].v;
+    return {
+      ba: ba, xin: xin, mi: mi,
+      rank: rank,                 // 0=最高 2=最低
+      top: arr[0].k, mid: arr[1].k, low: arr[2].k,
+      topV: top, midV: arr[1].v, lowV: low,
+      spread: top - low           // 最大落差：越大说明取向越鲜明
+    };
+  },
+
+  /**
+   * 相对画像判定：cond.rel 形如
+   *   { top: 'ba' }             该数值必须是三项里最高的
+   *   { anyTop: ['ba','mi'] }   该数值在最高或次高（不能垫底）
+   *   { low: 'xin' }            该数值必须是最低的
+   *   { gap: 3 }                最高项比最低项至少高 3（取向够鲜明）
+   *   { over: 'xin' }           相对比较：top 项要至少不低于 over 项
+   * 多个键是「与」关系，可混用。
+   */
+  relMet: function (rel) {
+    if (!rel) return true;
+    var p = this.statProfile();
+    if (rel.top && p.top !== rel.top) return false;
+    if (rel.low && p.low !== rel.low) return false;
+    if (rel.anyTop) {
+      var ok = false;
+      for (var i = 0; i < rel.anyTop.length; i++) {
+        if (p.rank[rel.anyTop[i]] === 0) { ok = true; break; }
+      }
+      if (!ok) return false;
+    }
+    // notLow: 指定项不能垫底
+    if (rel.notLow) {
+      if (p.rank[rel.notLow] === 2) return false;
+    }
+    if (typeof rel.gap === 'number' && p.spread < rel.gap) return false;
+    return true;
+  },
+
+  /**
+   * 选项可见性判定。
+   *
+   * cond 支持四种写法，可混用：
+   *   {mi: 2}                → mi >= 2            （至少）
+   *   {ba: {max: 1}}         → ba <= 1            （至多，用于"温柔路线专属"）
+   *   {ba: {min: 2, max: 4}} → 2 <= ba <= 4       （区间）
+   *   {rel: {top:'ba'}}      → 霸气是三值里最高的  （相对画像）
+   *
+   * 需要上限的原因是：只写 "mi>=2" 时，数值很高的玩家会同时看到
+   * "霸道路线"和"温情路线"两个互斥选项，分支就失去意义了。
+   */
+  condMet: function (cond) {
+    if (!cond) return true;
+    if (cond.rel) return this.relMet(cond.rel);
+    for (var k in cond) {
+      if (!Object.prototype.hasOwnProperty.call(cond, k)) continue;
+      if (k === 'rel') continue;
+      var v = this.state[k] || 0;
+      var need = cond[k];
+      if (typeof need === 'number') {
+        if (v < need) return false;
+      } else if (need && typeof need === 'object') {
+        if (typeof need.min === 'number' && v < need.min) return false;
+        if (typeof need.max === 'number' && v > need.max) return false;
       }
     }
     return true;
+  },
+
+  /** 兼容旧名：cond 为对象形式，如 {mi:2} 表示 mi>=2 */
+  choiceVisible: function (c) {
+    return this.condMet(c && c.cond);
   },
 
   renderChoices: function (now) {
@@ -187,10 +378,8 @@ var Game = {
       this.typing = false;
     }
 
-    // 台词已全部播完，重新评估该出选项还是进结局
-    if (this.lineIdx >= this.lines.length && !this.choices.length && !this.ending) {
-      this.afterLine();
-    }
+    // 台词已全部播完，重新评估该出选项还是进结局（afterLine 内部幂等）
+    this.afterLine();
   },
 
   update: function (dt) {
@@ -227,6 +416,15 @@ var Game = {
         if (target) return target;
       }
     }
+
+    // 自愈兜底：台词播完了、既没选项也没在转场 —— 说明收尾被漏掉了
+    // （打字机与点击同一帧竞争、或从中断状态恢复时都可能发生）。
+    // 不做这个兜底的话，玩家会永久卡在最后一句、点哪都没反应。
+    if (!this.typing && !this.choices.length && !this.ending &&
+        this.lines.length && this.lineIdx >= this.lines.length && this.flashT < 0) {
+      this.afterLine();
+    }
+
     return null;
   },
 
@@ -250,6 +448,22 @@ var Game = {
     ctx.fillStyle = '#cfc9dd';
     ctx.textAlign = 'left';
     ctx.fillText(this.scene ? (this.scene.act || '') : '', fs(20), R.SAFE_TOP + fs(15));
+
+    // 续玩提示：进入后的头几秒淡出，让玩家知道「接着上次」生效了。
+    // 没有这个提示时，玩家从第三幕被丢回来会以为程序出错了。
+    if (this.resumed) {
+      var hp = this.clock;
+      if (hp < 3.2) {
+        var ha = hp < 2.2 ? 1 : Math.max(0, (3.2 - hp) / 1.0);
+        ctx.globalAlpha = ha;
+        ctx.font = fs(11) + 'px sans-serif';
+        ctx.fillStyle = '#e0c778';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText('· 已回到上次进度', fs(20), R.SAFE_TOP + fs(15) + fs(17));
+        ctx.globalAlpha = 1;
+      }
+    }
 
     // 图鉴按钮
     var hbW = fs(52), hbH = fs(24);
@@ -344,13 +558,36 @@ var Game = {
     }
   },
 
+  /**
+   * 选项按钮的尺寸（随选项数量自适应，保证小屏也不挤爆台词区）。
+   *
+   * 4 个选项在 667 高的小屏上，按固定 52 会只剩 36px 台词区（约半行），
+   * 所以超过 3 个时逐级压缩按钮高度与间距，并给台词区留至少 2 行。
+   */
+  choiceMetrics: function () {
+    var fs = R.fontSize;
+    var n = this.choices.length || 1;
+    var btnH, gap;
+    if (n <= 3) { btnH = fs(52); gap = fs(10); }
+    else if (n === 4) { btnH = fs(46); gap = fs(8); }
+    else { btnH = fs(42); gap = fs(7); }
+
+    // 兜底：确保台词区至少能放下 2 行
+    var lineFS = fs(19);
+    var minStage = lineFS * 1.95 * 2;
+    var stageTop = R.H * 0.50 + fs(34);
+    var maxChoicesH = R.H - R.SAFE_BOTTOM - fs(20) - stageTop - minStage;
+    while (btnH > fs(34) && (n * btnH + (n - 1) * gap + fs(6)) > maxChoicesH) {
+      btnH -= fs(2);
+      gap = Math.max(fs(4), gap - fs(1));
+    }
+    return { btnH: btnH, gap: gap };
+  },
+
   choicesHeight: function () {
     var fs = R.fontSize;
-    var h = 0;
-    for (var i = 0; i < this.choices.length; i++) {
-      h += fs(52) + fs(10);
-    }
-    return h + fs(6);
+    var m = this.choiceMetrics();
+    return this.choices.length * m.btnH + Math.max(0, this.choices.length - 1) * m.gap + fs(6);
   },
 
   drawChoices: function (t) {
@@ -358,8 +595,9 @@ var Game = {
     var fs = R.fontSize;
     var padX = fs(20);
     var btnW = R.W - padX * 2;
-    var btnH = fs(52);
-    var gap = fs(10);
+    var m = this.choiceMetrics();
+    var btnH = m.btnH;
+    var gap = m.gap;
     var self = this;
 
     var totalH = this.choices.length * btnH + (this.choices.length - 1) * gap;
@@ -385,12 +623,15 @@ var Game = {
       R.roundRectFill(padX, y, btnW, btnH, 14, g);
       R.roundRectStroke(padX, y, btnW, btnH, 14, 'rgba(230,200,122,0.32)', 1);
 
-      ctx.font = fs(15.5) + 'px sans-serif';
+      // 选项多时字号同步收一点，长文案才放得下
+      var n = self.choices.length;
+      var labelFS = n <= 3 ? fs(15.5) : (n === 4 ? fs(14.5) : fs(13.5));
+
+      ctx.font = 'bold ' + labelFS + 'px sans-serif';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#c8a24a';
-      ctx.font = 'bold ' + fs(15.5) + 'px sans-serif';
       ctx.fillText(String.fromCharCode(65 + i) + '.', padX + fs(17), y + btnH / 2);
-      ctx.font = fs(15.5) + 'px sans-serif';
+      ctx.font = labelFS + 'px sans-serif';
       ctx.fillStyle = '#f4ecd8';
 
       // 选项文案也可能过长，做一次裁剪
@@ -440,6 +681,17 @@ var Game = {
     // 其余区域：推进台词
     this.nextLine();
     return null;
+  },
+
+  /**
+   * 供引擎在 onHide（切后台 / 可能被回收）时调用，主动落盘一次。
+   *
+   * 平时靠 show() 落盘已经够用，但有一个缝隙：玩家在某个场景里
+   * 连点推进台词时被切走，此时场景没变、数值没变，断点也仍然有效，
+   * 所以这里主要是「把内存里最新的数值兜住」。
+   */
+  saveNow: function () {
+    this.persist();
   }
 };
 

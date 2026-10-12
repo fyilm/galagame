@@ -14,3 +14,13 @@ desktop.ini
 # 依赖与构建产物（当前项目为纯原生，无此目录，保留规则以防后续引入）
 node_modules/
 dist/
+
+# 临时脚本 / 截图 / 备份：这些是排查与验证用的过程产物，不入库。
+#
+# 加这段的直接原因：本项目的剧本（js/script_duanju.js）长期只在工作区改动、
+# 从未提交，导致一次误操作（git checkout）把多轮成果全部覆盖且无法找回。
+# 剧本本身必须入库，但这些过程文件不必。
+.workbuddy/tmp_*.js
+.workbuddy/preview/
+.workbuddy/script_duanju.*.js
+.workbuddy/branch_scenes.js
