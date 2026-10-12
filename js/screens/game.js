@@ -152,7 +152,7 @@ var Game = {
       return;
     }
     // 若台词已播完却没有选项/结局（异常数据兜底），重新评估一次
-    if (this.lineIdx >= this.lines.length && !this.typing && !this.choices.length) {
+    if (this.lines && this.lineIdx >= this.lines.length && !this.typing && !this.choices.length) {
       this.afterLine();
     }
   },
