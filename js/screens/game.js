@@ -24,6 +24,7 @@ var Game = {
   clock: 0,          // 场景内累计时间（秒）
   choicesBorn: 0,    // 选项生成时刻（场景内秒数）
   flashT: -1,        // 转场黑场计时，-1 表示未在转场
+  locked: false,     // 已选定选项、正在转场：屏蔽输入，防止连点卡死
   switchTo: null,     // 转场完成后要切换到的场景名
   gotoScene: null,    // 转场完成后要载入的剧情节点
 
@@ -57,6 +58,7 @@ var Game = {
     this.choices = [];
     this.ending = null;
     this.choicesBorn = 0;
+    this.locked = false;   // 解锁，允许新场景接受输入
   },
 
   /** 开始播放新的一句 */
@@ -133,6 +135,28 @@ var Game = {
 
   /* ============ 更新 ============ */
 
+  /**
+   * 补完被中断的转场。
+   * 场景：选完选项后 0.42s 转场期间退出（返回剧集库/图鉴），再回到剧情页。
+   * 此时 gotoScene 还挂着但 flashT 已被复位，update() 不会再处理它，
+   * 会导致页面卡死。这里立即完成跳转，恢复可玩状态。
+   */
+  resumePending: function () {
+    this.flashT = -1;
+    this.locked = false;
+
+    if (this.gotoScene) {
+      var to = this.gotoScene;
+      this.gotoScene = null;
+      this.show(to);            // show() 内部会 locked = false
+      return;
+    }
+    // 若台词已播完却没有选项/结局（异常数据兜底），重新评估一次
+    if (this.lineIdx >= this.lines.length && !this.typing && !this.choices.length) {
+      this.afterLine();
+    }
+  },
+
   update: function (dt) {
     Portrait.update(dt);
     this.clock += dt;
@@ -158,11 +182,12 @@ var Game = {
         if (this.gotoScene) {
           var to = this.gotoScene;
           this.gotoScene = null;
-          this.show(to);
+          this.show(to);          // show() 内部会 locked = false
         }
 
         var target = this.switchTo;
         this.switchTo = null;
+        this.locked = false;   // 转场结束，解除输入封锁
         if (target) return target;
       }
     }
@@ -354,7 +379,8 @@ var Game = {
   /* ============ 交互 ============ */
 
   onTap: function (id) {
-    if (this.flashT >= 0) return null;
+    // 转场进行中 / 已选定选项：屏蔽一切输入，避免连点把 flashT 反复清零
+    if (this.flashT >= 0 || this.locked) return null;
 
     if (id === 'collect') return 'collect';
 
@@ -363,6 +389,10 @@ var Game = {
       var c = this.choices[i];
       if (c) {
         this.applyEff(c.eff);
+        // 关键：立刻清空选项并上锁，否则选项在 0.42s 转场期间仍可点击，
+        // 玩家连点会不断把 flashT 重置为 0，转场永远走不完 → 卡死
+        this.choices = [];
+        this.locked = true;
         this.flashT = 0;
         this.switchTo = null;
         this.gotoScene = c.to;

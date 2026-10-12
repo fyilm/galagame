@@ -55,12 +55,28 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
 
   switchTo: function (name, arg, keepState) {
     if (!SCREENS[name]) return;
+
+    // 防连点：距上次切屏过近时忽略重复请求，避免同一瞬间被切两次
+    // （例如结局页按钮在淡入期间仍可命中，连点会跳转两次）
+    var now = Date.now();
+    if (this._lastSwitch && now - this._lastSwitch < 260 && name === this._lastTarget) {
+      return;
+    }
+    this._lastSwitch = now;
+    this._lastTarget = name;
+
     this.prevScreen = this.cur;
     this.cur = name;
     this.t = 0;
     // keepState：从图鉴返回剧情页时，保留已播放的进度
     if (!keepState) {
       SCREENS[name].enter(arg);
+    } else if (name === 'game') {
+      // 保留现场回到剧情页：若上次在「选完选项、转场进行中」离开，
+      // 会残留 gotoScene + flashT/locked。此时 gotoScene 只有在
+      // flashT>=0 时才会被处理，一旦复位 flashT 就永远没人处理它 →
+      // 页面卡死。所以这里直接把未完成的转场补完。
+      Game.resumePending();
     }
   },
 
