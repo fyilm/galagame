@@ -46,6 +46,19 @@ var Engine = {
       });
     }
 
+    // 前后台切换：后台停循环，回前台重置时间基准并重启循环。
+    // 真机上不加这段，切后台再回来可能出现画面停在那一帧不动（看起来像卡死）。
+    if (wx.onShow) {
+      wx.onShow(function () {
+        Engine.onShow();
+      });
+    }
+    if (wx.onHide) {
+      wx.onHide(function () {
+        Engine.onHide();
+      });
+    }
+
     this.lastTime = Date.now();
     this.running = true;
     this.loop();
@@ -95,8 +108,13 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     // 这是内部流转，返回栈沿用来源（如从剧集库进来，仍回剧集库）
     var next = screen.update(dt);
     if (next && SCREENS[next]) {
-      // 剧情 → 结局：追加到来源链，返回时能回到剧情/剧集库
-      this.backStack = this.backStack.slice(0, this.backIndex + 1).concat(['ending']);
+      // 剧情 → 结局：追加到来源链，返回时能回到剧情/剧集库。
+      // 注意：game.update() 返回 'ending' 时 cur 还是 'game'，
+      // 所以不能拿 next 和 cur 比较来判断是否重复，否则会漏掉这次切屏。
+      // 这里只在「链末位不是 next」时才追加，避免重复堆积。
+      if (this.backStack[this.backStack.length - 1] !== next) {
+        this.backStack = this.backStack.slice(0, this.backIndex + 1).concat([next]);
+      }
       this.backIndex = this.backStack.length - 1;
       // 结局页需要传入结局对象
       if (next === 'ending') {
@@ -115,6 +133,20 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
     } else {
       setTimeout(function () { self.loop(); }, 16);
     }
+  },
+
+  /** 从后台回前台：重置时间基准，避免 dt 异常把动画/打字机带飞或停摆 */
+  onShow: function () {
+    this.lastTime = Date.now();
+    if (!this.running) {
+      this.running = true;
+      this.loop();
+    }
+  },
+
+  onHide: function () {
+    // 主动停掉主循环，回前台时由 onShow 重新拉起
+    this.running = false;
   },
 
   render: function (screen) {
@@ -202,7 +234,15 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
    *    再在剧集库返回→'title'。
    */
   back: function () {
-    if (this.backIndex > 0) this.backIndex--;
+    // 从图鉴返回：还原进入图鉴前的链，避免链被 collect 撑长
+    if (this.cur === 'collect' && this._collectReturn) {
+      this.backStack = this._collectReturn.stack.slice();
+      this.backIndex = this._collectReturn.index;
+      this._collectReturn = null;
+    } else if (this.backIndex > 0) {
+      this.backIndex--;
+    }
+
     var target = this.backStack[this.backIndex] || 'title';
     if (!SCREENS[target]) target = 'title';
     // 剧情页与结局页保留现场，其余页面重新初始化
@@ -257,10 +297,17 @@ fromLibrary: false,// 从剧本库进入游戏时，返回键应回到剧本库
       return;
     }
 
-    // 进入图鉴：在当前链末位追加一层，返回时自然回到这里
+    // 进入图鉴：作为「覆盖层」压在当前层之上。
+    // 注意：链里最多只保留一层 collect，且返回时把它弹掉。
+    // 否则反复进出图鉴会让 backStack 无限膨胀
+    // （["title","game","collect","collect",...]），返回逻辑错乱。
     if (result === 'collect') {
-      this.backStack = this.backStack.slice(0, this.backIndex + 1).concat(['collect']);
-      this.backIndex = this.backStack.length - 1;
+      this._collectReturn = {
+        stack: this.backStack.slice(0, this.backIndex + 1),
+        index: this.backIndex
+      };
+      this.backStack = this._collectReturn.stack.concat(['collect']);
+      this.backIndex = this._collectReturn.stack.length;
       this.switchTo('collect');
       return;
     }

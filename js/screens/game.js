@@ -136,23 +136,59 @@ var Game = {
   /* ============ 更新 ============ */
 
   /**
-   * 补完被中断的转场。
-   * 场景：选完选项后 0.42s 转场期间退出（返回剧集库/图鉴），再回到剧情页。
-   * 此时 gotoScene 还挂着但 flashT 已被复位，update() 不会再处理它，
-   * 会导致页面卡死。这里立即完成跳转，恢复可玩状态。
+   * 从别的页面（图鉴/剧集库）返回剧情页时，修复被中断的状态。
+   *
+   * 可能被中断的时机有三类，都必须处理，否则会卡死：
+   *  1) 选完选项、0.42s 转场期间离开 → gotoScene 挂着但 flashT 已复位，
+   *     update() 只在 flashT>=0 时处理 gotoScene，于是永远无人处理。
+   *  2) 最后一句台词正在打字时离开 → typing=true，回来后若打字机没继续推进，
+   *     选项/结局永远不会触发。
+   *  3) 最后一句台词已播完、afterLine 还没执行就离开 → 选项永远不出现。
+   *
+   * 处理原则：复位转场锁 → 补完待跳转 → 重新评估"该出什么"。
    */
   resumePending: function () {
+    // 结局转场正在进行（flashT>=0 且目标是 ending）：不要打断它，
+    // 让它自然跑完并由 update() 返回 'ending'。若这里把 flashT 清零，
+    // 转场永远走不完，玩家会永久卡在剧情页最后一帧。
+    if (this.flashT >= 0 && this.switchTo === 'ending' && this.ending) {
+      return;
+    }
+
+    // 保存可能被中断的「切到结局页」请求。注意不能直接清掉 switchTo，
+    // 否则若中断发生在结局转场的 0.42s 内，update() 再也不会返回 'ending'。
+    var pendingSwitch = this.switchTo;
+
+    // 解除转场黑场，避免残留的 flashT 卡住输入
     this.flashT = -1;
     this.locked = false;
+    this.switchTo = null;
 
+    // 补完被中断的场景跳转
     if (this.gotoScene) {
       var to = this.gotoScene;
       this.gotoScene = null;
       this.show(to);            // show() 内部会 locked = false
       return;
     }
-    // 若台词已播完却没有选项/结局（异常数据兜底），重新评估一次
-    if (this.lines && this.lineIdx >= this.lines.length && !this.typing && !this.choices.length) {
+
+    // 结局页切屏被中断：重新发起，让 update() 能正常驱动转场
+    if (pendingSwitch === 'ending' && this.ending) {
+      this.flashT = 0;
+      this.switchTo = 'ending';
+      return;
+    }
+
+    if (!this.lines || !this.lines.length) return;
+
+    // 台词正打到一半：立即补完，避免依赖打字机继续跑（可能因 dt 异常停住）
+    if (this.typing) {
+      this.typed = this.lines[this.lineIdx - 1].length;
+      this.typing = false;
+    }
+
+    // 台词已全部播完，重新评估该出选项还是进结局
+    if (this.lineIdx >= this.lines.length && !this.choices.length && !this.ending) {
       this.afterLine();
     }
   },
