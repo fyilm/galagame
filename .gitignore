@@ -1,0 +1,16 @@
+# 开发者工具本地配置（含个人 AppID、路径等，不应提交）
+project.private.config.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 依赖与构建产物（当前项目为纯原生，无此目录，保留规则以防后续引入）
+node_modules/
+dist/

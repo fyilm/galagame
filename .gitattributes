@@ -1,0 +1,9 @@
+# 统一换行符为 LF，避免跨平台协作时整个文件显示为「已修改」
+* text=auto eol=lf
+
+# 二进制资源不做换行转换
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.mp3 binary
+*.mp4 binary
