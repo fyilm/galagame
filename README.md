@@ -30,6 +30,47 @@
 
 **跨平台**：macOS / Linux 同样可用，代码无任何平台相关调用。
 
+## Git 工作流
+
+仓库已初始化（分支 `main`），首次提交已包含全部源码与素材。
+
+**换机继续开发：**
+
+```bash
+git clone <仓库地址> galagame
+cd galagame
+```
+
+然后用微信开发者工具导入该目录即可。
+
+**日常开发：**
+
+```bash
+git add .
+git commit -m "描述"
+git push
+```
+
+**约定**
+
+- `project.private.config.json` 已被`.gitignore` 排除 —— 它是每台机器各自的本地配置，
+  不应提交。换机后会自动重建（或手动创建，内容见下）
+- `.gitattributes` 已固定换行符为 LF，避免 Windows / macOS 间协作时整个文件显示为「已修改」
+- 素材放在 `images/<剧本id>/`，新增剧本时新建对应目录
+
+**换机后若需要 `project.private.config.json`**，创建它并填入：
+
+```json
+{
+  "libVersion": "3.17.3",
+  "projectname": "galagame",
+  "setting": {
+    "urlCheck": false,
+    "es6": true
+  }
+}
+```
+
 ## 页面结构
 
 ```
